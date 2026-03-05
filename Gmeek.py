@@ -6,6 +6,9 @@ import time
 import datetime
 import shutil
 import urllib
+import hashlib
+import shlex
+import subprocess
 import requests
 import argparse
 import html
@@ -49,6 +52,11 @@ class GMEEK():
         self.repo = self.get_repo(user, options.repo_name)
         self.feed = FeedGenerator()
         self.oldFeedString=''
+        self.render_env = Environment(loader=FileSystemLoader('templates'))
+        self.renderer_version = "gmeek-renderer-v1"
+        self.markdown_cache_file = "markdown_cache.json"
+        self.markdown_cache = self.loadMarkdownCache()
+        self.previousIssueMeta = self.loadPreviousIssueMeta()
 
         self.labelColorDict=json.loads('{}')
         for label in self.repo.get_labels():
@@ -88,7 +96,7 @@ class GMEEK():
             print("static does not exist")
 
     def defaultConfig(self):
-        dconfig={"singlePage":[],"startSite":"","filingNum":"","onePageListNum":15,"commentLabelColor":"#006b75","yearColorList":["#bc4c00", "#0969da", "#1f883d", "#A333D0"],"i18n":"CN","themeMode":"manual","dayTheme":"light","nightTheme":"dark","urlMode":"pinyin","script":"","style":"","head":"","indexScript":"","indexStyle":"","bottomText":"","showPostSource":1,"iconList":{},"UTC":+8,"rssSplit":"sentence","exlink":{},"needComment":1,"allHead":""}
+        dconfig={"singlePage":[],"startSite":"","filingNum":"","onePageListNum":15,"commentLabelColor":"#006b75","yearColorList":["#bc4c00", "#0969da", "#1f883d", "#A333D0"],"i18n":"CN","themeMode":"manual","dayTheme":"light","nightTheme":"dark","urlMode":"pinyin","script":"","style":"","head":"","indexScript":"","indexStyle":"","bottomText":"","showPostSource":1,"iconList":{},"UTC":+8,"rssSplit":"sentence","exlink":{},"needComment":1,"allHead":"","backupMarkdown":0,"markdownRenderer":"github_api","forceRefreshPinned":0,"forceFullIndexes":0}
         config=json.loads(open('config.json', 'r', encoding='utf-8').read())
         self.blogBase={**dconfig,**config}.copy()
         self.blogBase["postListJson"]=json.loads('{}')
@@ -121,6 +129,9 @@ class GMEEK():
             self.i18n=i18n
         
         self.TZ=datetime.timezone(datetime.timedelta(hours=self.blogBase["UTC"]))
+        self.markdown_renderer = str(self.blogBase.get("markdownRenderer", "github_api")).lower()
+        if self.markdown_renderer not in ["github_api", "rust"]:
+            self.markdown_renderer = "github_api"
 
     def get_repo(self,user:Github, repo:str):
         return user.get_repo(repo)
@@ -135,20 +146,128 @@ class GMEEK():
         except requests.RequestException as e:
             raise Exception("markdown2html error: {}".format(e))
 
+    def loadMarkdownCache(self):
+        if os.path.exists(self.markdown_cache_file):
+            try:
+                with open(self.markdown_cache_file, 'r', encoding='utf-8') as f:
+                    return json.loads(f.read())
+            except Exception:
+                return {}
+        return {}
+
+    def markdown2htmlRust(self, mdstr):
+        cmd = os.environ.get("GMEEK_RUST_RENDERER_CMD", "").strip()
+        if cmd == "":
+            raise RuntimeError("GMEEK_RUST_RENDERER_CMD is not configured")
+
+        result = subprocess.run(
+            shlex.split(cmd),
+            input=mdstr,
+            text=True,
+            capture_output=True,
+            check=True,
+            encoding='utf-8'
+        )
+        return result.stdout
+
+    def markdown2htmlWithFallback(self, mdstr):
+        if self.markdown_renderer == "rust":
+            try:
+                return self.markdown2htmlRust(mdstr)
+            except Exception as e:
+                print(f"rust renderer fallback to github_api: {e}")
+        return self.markdown2html(mdstr)
+
+
+    def saveMarkdownCache(self):
+        with open(self.markdown_cache_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(self.markdown_cache, ensure_ascii=False))
+
+    def buildMarkdownCacheKey(self, issue):
+        issue_number = issue.get("issueNumber", "")
+        if issue_number in [None, ""]:
+            issue_number = issue.get("postUrl", "")
+        updated_at = issue.get("updatedAt", "")
+        if updated_at in [None, ""]:
+            updated_at = issue.get("createdAt", "")
+
+        body_hash = issue.get("issueBodyHash", "")
+        if body_hash in [None, ""]:
+            issue_body = issue.get("issueBody", "")
+            if issue_body is None:
+                issue_body = ""
+            body_hash = hashlib.sha1(str(issue_body).encode('utf-8')).hexdigest()
+
+        return f"{issue_number}:{updated_at}:{body_hash}:{self.renderer_version}:{self.markdown_renderer}"
+
+    def renderMarkdownWithCache(self, issue):
+        cache_key = self.buildMarkdownCacheKey(issue)
+        cache_item = self.markdown_cache.get(cache_key)
+        if cache_item and isinstance(cache_item, dict) and "html" in cache_item:
+            return cache_item["html"]
+
+        post_body = self.markdown2htmlWithFallback(issue.get("issueBody", "") or "")
+        self.markdown_cache[cache_key] = {"html": post_body}
+        return post_body
+
+    def cleanupMarkdownCache(self):
+        valid_keys = set()
+        for issue_dict in self.blogBase["postListJson"].values():
+            valid_keys.add(self.buildMarkdownCacheKey(issue_dict))
+        for issue_dict in self.blogBase["singeListJson"].values():
+            valid_keys.add(self.buildMarkdownCacheKey(issue_dict))
+
+        self.markdown_cache = {k: v for k, v in self.markdown_cache.items() if k in valid_keys}
+
+    def loadPreviousIssueMeta(self):
+        if not os.path.exists("blogBase.json"):
+            return {}
+        try:
+            with open("blogBase.json", "r", encoding='utf-8') as f:
+                old_blog = json.loads(f.read())
+            issue_meta = {}
+            for list_name in ["postListJson", "singeListJson"]:
+                for key, value in old_blog.get(list_name, {}).items():
+                    if key.startswith("P") and isinstance(value, dict):
+                        issue_number = str(value.get("issueNumber", "") or key[1:])
+                        issue_meta[issue_number] = {
+                            "postUrl": value.get("postUrl", ""),
+                            "labels": value.get("labels", []),
+                            "createdAt": value.get("createdAt", 0),
+                            "description": value.get("description", ""),
+                            "top": value.get("top", 0),
+                            "commentNum": value.get("commentNum", 0),
+                            "postTitle": value.get("postTitle", ""),
+                            "issueBodyHash": value.get("issueBodyHash", ""),
+                            "updatedAt": value.get("updatedAt", ""),
+                            "singlePage": 1 if list_name == "singeListJson" else 0
+                        }
+            return issue_meta
+        except Exception:
+            return {}
+
+    def getPinnedState(self, issue, previous_top=None):
+        force_refresh = int(self.blogBase.get("forceRefreshPinned", 0)) == 1
+        if previous_top is not None and not force_refresh:
+            return previous_top
+
+        top_value = 0
+        for event in issue.get_events():
+            if event.event=="pinned":
+                top_value=1
+            elif event.event=="unpinned":
+                top_value=0
+        return top_value
+
     def renderHtml(self,template,blogBase,postListJson,htmlDir,icon):
-        file_loader = FileSystemLoader('templates')
-        env = Environment(loader=file_loader)
-        template = env.get_template(template)
-        output = template.render(blogBase=blogBase,postListJson=postListJson,i18n=self.i18n,IconList=icon)
+        template_obj = self.render_env.get_template(template)
+        output = template_obj.render(blogBase=blogBase,postListJson=postListJson,i18n=self.i18n,IconList=icon)
         f = open(htmlDir, 'w', encoding='UTF-8')
         f.write(output)
         f.close()
 
     def createPostHtml(self,issue):
-        mdFileName=re.sub(r'[<>:/\\|?*\"]|[\0-\31]', '-', issue["postTitle"])
-        f = open(self.backup_dir+mdFileName+".md", 'r', encoding='UTF-8')
-        post_body=self.markdown2html(f.read())
-        f.close()
+        post_body=self.renderMarkdownWithCache(issue)
 
         postBase=self.blogBase.copy()
 
@@ -323,14 +442,27 @@ class GMEEK():
                 gen_Html = self.post_dir+htmlFile
 
             postNum="P"+str(issue.number)
+            previous_issue = self.previousIssueMeta.get(str(issue.number), {})
             self.blogBase[listJsonName][postNum]=json.loads('{}')
-            self.blogBase[listJsonName][postNum]["htmlDir"]=gen_Html
             self.blogBase[listJsonName][postNum]["labels"]=[label.name for label in issue.labels]
             self.blogBase[listJsonName][postNum]["postTitle"]=issue.title
             self.blogBase[listJsonName][postNum]["postUrl"]=urllib.parse.quote(gen_Html[len(self.root_dir):])
 
             self.blogBase[listJsonName][postNum]["postSourceUrl"]="https://github.com/"+options.repo_name+"/issues/"+str(issue.number)
-            self.blogBase[listJsonName][postNum]["commentNum"]=issue.get_comments().totalCount
+            self.blogBase[listJsonName][postNum]["issueNumber"]=issue.number
+            self.blogBase[listJsonName][postNum]["updatedAt"]=issue.updated_at.isoformat() if issue.updated_at else ""
+            issue_body_text = issue.body if issue.body is not None else ""
+            previous_body_hash = previous_issue.get("issueBodyHash", "")
+            issue_body_hash = previous_body_hash if issue_body_text == "" and previous_body_hash else hashlib.sha1(issue_body_text.encode('utf-8')).hexdigest()
+            self.blogBase[listJsonName][postNum]["issueBodyHash"]=issue_body_hash
+            self.blogBase[listJsonName][postNum]["issueBody"]=issue_body_text
+
+            previous_updated_at = previous_issue.get("updatedAt", "")
+            should_refresh_comments = (self.blogBase[listJsonName][postNum]["updatedAt"] != previous_updated_at) or (issue_body_hash != previous_body_hash)
+            if should_refresh_comments:
+                self.blogBase[listJsonName][postNum]["commentNum"]=issue.comments
+            else:
+                self.blogBase[listJsonName][postNum]["commentNum"]=previous_issue.get("commentNum", 0)
 
             if issue.body==None:
                 self.blogBase[listJsonName][postNum]["description"]=''
@@ -346,12 +478,8 @@ class GMEEK():
                     period=self.blogBase["rssSplit"]
                 self.blogBase[listJsonName][postNum]["description"]=issue.body.split(period)[0].replace("\"", "\'")+period
                 
-            self.blogBase[listJsonName][postNum]["top"]=0
-            for event in issue.get_events():
-                if event.event=="pinned":
-                    self.blogBase[listJsonName][postNum]["top"]=1
-                elif event.event=="unpinned":
-                    self.blogBase[listJsonName][postNum]["top"]=0
+            previous_top = previous_issue.get("top")
+            self.blogBase[listJsonName][postNum]["top"]=self.getPinnedState(issue, previous_top)
 
             try:
                 postConfig=json.loads(issue.body.split("\r\n")[-1:][0].split("##")[1])
@@ -391,19 +519,22 @@ class GMEEK():
             self.blogBase[listJsonName][postNum]["createdDate"]=thisTime.strftime("%Y-%m-%d")
             self.blogBase[listJsonName][postNum]["dateLabelColor"]=self.blogBase["yearColorList"][int(thisYear)%len(self.blogBase["yearColorList"])]
 
-            mdFileName=re.sub(r'[<>:/\\|?*\"]|[\0-\31]', '-', issue.title)
-            f = open(self.backup_dir+mdFileName+".md", 'w', encoding='UTF-8')
-            
-            if issue.body==None:
-                f.write('')
-            else:
-                f.write(issue.body)
-            f.close()
+            if int(self.blogBase.get("backupMarkdown", 0)) == 1:
+                mdFileName=re.sub(r'[<>:/\\|?*\"]|[\0-\31]', '-', issue.title)
+                f = open(self.backup_dir+mdFileName+".md", 'w', encoding='UTF-8')
+
+                if issue.body==None:
+                    f.write('')
+                else:
+                    f.write(issue.body)
+                f.close()
             return listJsonName
 
     def runAll(self):
         print("====== start create static html ======")
         self.cleanFile()
+        self.blogBase["postListJson"]={}
+        self.blogBase["singeListJson"]={}
 
         issues=self.repo.get_issues()
         for issue in issues:
@@ -417,16 +548,38 @@ class GMEEK():
 
         self.createPlistHtml()
         self.createFeedXml()
+        for issue_dict in self.blogBase["postListJson"].values():
+            issue_dict.pop("issueBody", None)
+        for issue_dict in self.blogBase["singeListJson"].values():
+            issue_dict.pop("issueBody", None)
         print("====== create static html end ======")
 
     def runOne(self,number_str):
         print("====== start create static html ======")
         issue=self.repo.get_issue(int(number_str))
         if issue.state == "open":
+            force_full_indexes = int(self.blogBase.get("forceFullIndexes", 0)) == 1
+            previous_meta = self.previousIssueMeta.get(str(issue.number), {})
+            previous_list = "singeListJson" if previous_meta.get("singlePage", 0) == 1 else "postListJson"
             listJsonName=self.addOnePostJson(issue)
-            self.createPostHtml(self.blogBase[listJsonName]["P"+number_str])
-            self.createPlistHtml()
-            self.createFeedXml()
+            current_post = self.blogBase[listJsonName]["P"+number_str]
+            self.createPostHtml(current_post)
+
+            labels_changed = previous_meta.get("labels", []) != current_post.get("labels", [])
+            post_url_changed = previous_meta.get("postUrl", "") != current_post.get("postUrl", "")
+            created_at_changed = previous_meta.get("createdAt", 0) != current_post.get("createdAt", 0)
+            description_changed = previous_meta.get("description", "") != current_post.get("description", "")
+            list_changed = previous_list != listJsonName
+
+            need_rebuild_index = force_full_indexes or list_changed or labels_changed or post_url_changed or created_at_changed
+            need_rebuild_feed = force_full_indexes or list_changed or post_url_changed or created_at_changed or description_changed
+
+            if need_rebuild_index:
+                self.createPlistHtml()
+            if need_rebuild_feed:
+                self.createFeedXml()
+            if not need_rebuild_index and not need_rebuild_feed:
+                print("runOne incremental mode: skip index/rss rebuild")
             print("====== create static html end ======")
         else:
             print("====== issue is closed ======")
@@ -462,22 +615,30 @@ else:
         oldFeedFile=open(blog.root_dir+'rss.xml','r',encoding='utf-8')
         blog.oldFeedString=oldFeedFile.read()
         oldFeedFile.close()
+
     if options.issue_number=="0" or options.issue_number=="":
         print("issue_number=='0', runAll")
         blog.runAll()
     else:
-        f=open("blogBase.json","r")
+        with open("blogBase.json","r",encoding='utf-8') as f:
+            oldBlogBase=json.loads(f.read())
         print("blogBase is exists and issue_number!=0, runOne")
-        oldBlogBase=json.loads(f.read())
         for key, value in oldBlogBase.items():
             blog.blogBase[key] = value
-        f.close()
         blog.blogBase["labelColorDict"]=blog.labelColorDict
         blog.runOne(options.issue_number)
 
 listFile=open("blogBase.json","w")
 listFile.write(json.dumps(blog.blogBase))
 listFile.close()
+
+for issue_dict in blog.blogBase["postListJson"].values():
+    issue_dict.pop("issueBody", None)
+for issue_dict in blog.blogBase["singeListJson"].values():
+    issue_dict.pop("issueBody", None)
+
+blog.cleanupMarkdownCache()
+blog.saveMarkdownCache()
 
 commentNumSum=0
 wordCount=0
@@ -492,6 +653,15 @@ for i in blog.blogBase["postListJson"]:
     del blog.blogBase["postListJson"][i]["style"]
     del blog.blogBase["postListJson"][i]["top"]
     del blog.blogBase["postListJson"][i]["ogImage"]
+
+    if 'issueNumber' in blog.blogBase["postListJson"][i]:
+        del blog.blogBase["postListJson"][i]["issueNumber"]
+    if 'updatedAt' in blog.blogBase["postListJson"][i]:
+        del blog.blogBase["postListJson"][i]["updatedAt"]
+    if 'issueBodyHash' in blog.blogBase["postListJson"][i]:
+        del blog.blogBase["postListJson"][i]["issueBodyHash"]
+    if 'issueBody' in blog.blogBase["postListJson"][i]:
+        del blog.blogBase["postListJson"][i]["issueBody"]
 
     if 'head' in blog.blogBase["postListJson"][i]:
         del blog.blogBase["postListJson"][i]["head"]
